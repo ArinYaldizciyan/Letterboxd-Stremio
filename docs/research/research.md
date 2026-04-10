@@ -18,6 +18,10 @@
 8. [Roadblockers & Risks](#roadblockers--risks)
 9. [Requirements](#requirements)
 10. [Recommendation](#recommendation)
+11. [Scaling Analysis: Headless Browser Scraping](#scaling-analysis-headless-browser-scraping)
+12. [Network Interception: Bypassing HTML Scraping](#network-interception-bypassing-html-scraping)
+13. [Existing Scraping Libraries](#existing-scraping-libraries)
+14. [Updated Recommendation](#updated-recommendation)
 
 ---
 
@@ -342,6 +346,217 @@ Multiple existing projects have successfully implemented Letterboxd → Stremio 
 
 ---
 
+## Scaling Analysis: Headless Browser Scraping
+
+### The Core Problem
+
+If we need to scrape every registered user's Letterboxd watchlist daily via a headless browser, each scrape involves spinning up a browser context, navigating to the page, waiting for JS to render, and parsing the result. This is **10-50x more resource-intensive** than a simple HTTP request.
+
+| Metric | Simple HTTP Request | Headless Browser |
+|--------|-------------------|------------------|
+| Time per page | 0.5–2 seconds | 3–15 seconds |
+| Memory per session | ~10 MB | 50–150 MB (new instance) or ~KB (shared context) |
+| CPU usage | Minimal | Significant (JS engine) |
+| Bandwidth | HTML only | HTML + CSS + JS + images |
+
+### Scaling Strategies
+
+**Browser Contexts (not instances) — Critical Optimization:**
+
+Rather than launching a new browser process per user, Playwright/Puppeteer support **browser contexts** — lightweight, isolated sessions within a single browser process. Creating a context takes single-digit milliseconds and negligible memory (KB, not MB). A single browser process can host **20-50+ concurrent contexts**.
+
+Architecture:
+```
+[Single Chromium Process]
+  ├── Context 1 → Scrape user_A's watchlist
+  ├── Context 2 → Scrape user_B's watchlist
+  ├── Context 3 → Scrape user_C's watchlist
+  └── ... (up to ~50 contexts)
+```
+
+**Estimated throughput with context pooling:**
+
+| Users | Strategy | Est. Time (daily cron) | Est. Memory |
+|-------|----------|----------------------|-------------|
+| 10 | 1 browser, sequential | ~2-5 min | ~200 MB |
+| 100 | 1 browser, 10 concurrent contexts | ~5-15 min | ~300 MB |
+| 1,000 | 2-3 browsers, 20 contexts each | ~30-60 min | ~1 GB |
+| 10,000 | Browser pool (5-10 instances) | ~2-5 hours | ~3-5 GB |
+
+**Additional optimization: block unnecessary resources.** Via `page.route()`, block images, fonts, CSS, analytics, and ads — we only need the DOM/JSON data. This can cut page load time by 50-70%.
+
+### Scaling Risks
+
+- **Crash blast radius:** If a browser process crashes, all 20-50 contexts in it die. Need retry logic.
+- **Memory leaks:** Chromium leaks memory over time. Must recycle browser instances periodically.
+- **IP rate limiting:** Letterboxd may throttle or block an IP making hundreds of requests. May need proxy rotation at scale.
+- **Cost:** At 10,000+ users, a VPS with 4-8 GB RAM and dedicated CPU is needed. Cloud browser services (Browserless.io, etc.) charge ~$0.01-0.05 per page.
+
+---
+
+## Network Interception: Bypassing HTML Scraping
+
+### The Insight (User's Question)
+
+> If JavaScript is used, that means it's likely a JS call is querying an API to populate the page. Could we intercept this JSON response similar to the browser's Network tab?
+
+**This is exactly the right intuition, and yes — Playwright supports this natively.**
+
+### How Letterboxd Loads Data
+
+Letterboxd's architecture:
+- **Backend:** Java on Apache Tomcat with PostgreSQL
+- **API:** `https://api.letterboxd.com/api/v0/` — the same API used by mobile apps
+- **Website:** The site uses JavaScript to make calls that populate the page with data
+
+The key question is: **does the website's JavaScript call `api.letterboxd.com` directly from the browser, or does the server render the HTML and send it pre-populated?**
+
+Based on research:
+- The **mobile apps** definitely call `api.letterboxd.com` directly (confirmed via [mitmproxy interception](https://blog.alexbeals.com/posts/extracting-letterboxd-tokens-with-mitmproxy))
+- The **website** appears to use a hybrid approach — some content is server-rendered, but dynamic features (like the "require JavaScript" warning) suggest client-side API calls are also made
+- The API uses OAuth2 Bearer tokens with a `client_id` and `client_secret` embedded in the app/site
+
+### Three Interception Strategies
+
+#### Strategy 1: Intercept XHR/Fetch Responses (Best Case)
+
+If the browser JS calls `api.letterboxd.com`, we can capture the JSON response directly:
+
+```javascript
+// Playwright - listen for API responses
+const watchlistData = [];
+page.on('response', async (response) => {
+  const url = response.url();
+  if (url.includes('api.letterboxd.com') && url.includes('watchlist')) {
+    const json = await response.json();
+    watchlistData.push(json);
+  }
+});
+await page.goto('https://letterboxd.com/username/watchlist/');
+// watchlistData now contains the raw API JSON — no HTML parsing needed
+```
+
+**Advantages:**
+- Clean, structured JSON data (includes TMDB IDs, metadata, everything)
+- No fragile CSS selector parsing
+- Much more resilient to UI changes (API contracts are more stable than HTML)
+- Could potentially extract the `client_id`/`client_secret` and call the API directly without a browser at all
+
+**Risks:**
+- If Letterboxd serves pre-rendered HTML (SSR) without client-side API calls, there's nothing to intercept
+- Letterboxd could change/obfuscate their internal API calls
+- Using extracted API credentials may violate ToS
+
+#### Strategy 2: Extract API Credentials (Highest Reward, Highest Risk)
+
+The [mitmproxy blog post](https://blog.alexbeals.com/posts/extracting-letterboxd-tokens-with-mitmproxy) demonstrates that Letterboxd apps use:
+- `client_id` and `client_secret` for OAuth2 authentication
+- `POST https://api.letterboxd.com/api/v0/auth/token` to get access tokens
+- Access tokens expire after 3600 seconds (1 hour)
+- Refresh tokens persist indefinitely
+
+If we could extract the website's `client_id`/`client_secret` from the JavaScript bundle:
+1. Call `/auth/token` with Client Credentials grant → get access token
+2. Call `/member/{id}/watchlist` directly → get JSON watchlist data
+3. **No browser needed at all** — pure HTTP requests, scales trivially
+
+**This would completely eliminate the headless browser scaling problem.**
+
+However:
+- Using extracted credentials is likely against Letterboxd's ToS
+- Letterboxd could rotate credentials and break this approach
+- Ethically questionable — we'd be using their private API without permission
+
+#### Strategy 3: HTML Interception (Fallback)
+
+Even if no client-side API calls are made, Playwright can still intercept the **server's HTML response** before it reaches the browser renderer:
+
+```javascript
+// Intercept the initial HTML response
+page.on('response', async (response) => {
+  if (response.url().includes('/watchlist') && response.headers()['content-type']?.includes('text/html')) {
+    const html = await response.text();
+    // Parse HTML server-side without waiting for JS rendering
+  }
+});
+```
+
+This is still faster than waiting for full page render, but doesn't give us structured JSON.
+
+### Recommended Interception Approach
+
+**Phase 1: Prototype and observe.** Launch Playwright against a Letterboxd watchlist page with full network logging. Identify exactly what requests the browser makes. Look for:
+- Calls to `api.letterboxd.com`
+- Calls to any `/ajax/` or JSON endpoints on `letterboxd.com`
+- Embedded JSON in `<script>` tags (common SSR pattern: `__NEXT_DATA__`, `window.__STATE__`, etc.)
+
+**Phase 2: Optimize based on findings.**
+- If client-side API calls exist → intercept JSON responses (Strategy 1)
+- If embedded JSON in HTML → parse it directly, no full render needed
+- If pure SSR HTML → fall back to HTML parsing with selectors
+
+### Impact on Scaling
+
+If network interception works (Strategy 1 or 2), the scaling picture changes dramatically:
+
+| Approach | Per-user cost | 1,000 users daily | 10,000 users daily |
+|----------|--------------|-------------------|-------------------|
+| Full headless render + parse | 5-15s, ~50MB | ~30-60 min, 1GB | Hours, 5GB+ |
+| Network interception (browser) | 2-5s, ~50MB | ~15-30 min, 1GB | ~1-2 hours, 5GB+ |
+| Direct API calls (no browser) | 0.5-2s, ~10MB | ~2-5 min, trivial | ~10-30 min, trivial |
+| Simple HTTP + parse (if works) | 0.5-2s, ~10MB | ~2-5 min, trivial | ~10-30 min, trivial |
+
+---
+
+## Existing Scraping Libraries
+
+Several Python libraries currently scrape Letterboxd successfully using **simple HTTP requests** (no headless browser):
+
+### letterboxdpy ([GitHub](https://github.com/nmcassa/letterboxdpy))
+
+- Active project with 688 commits
+- Web scraper using HTTP requests (requests + BeautifulSoup)
+- Has a dedicated `Watchlist` module — `Watchlist("username")` returns movies with slugs, names, years
+- Lazy-loads movie data on access
+- **No headless browser required** — suggesting simple HTTP scraping may still work for watchlists
+
+### Letterboxd-list-scraper ([GitHub](https://github.com/L-Dot/Letterboxd-list-scraper))
+
+- Uses requests + BeautifulSoup + lxml
+- Explicitly supports watchlists
+- Scrapes ~1.2 films/second
+- Last release June 2024 (v2.2.0)
+
+### Key Implication
+
+**The "JavaScript required" warning may not apply to all pages, or these libraries may still work despite it.** This needs to be validated with a quick test. If simple HTTP requests still work for watchlist pages, the entire headless browser concern is moot and scaling becomes trivial.
+
+---
+
+## Updated Recommendation
+
+### First Step: Validate Scraping Approach
+
+Before committing to a headless browser architecture, **prototype a simple HTTP scraper** for a Letterboxd watchlist. If `requests` + BeautifulSoup work, the project becomes significantly simpler and cheaper to scale.
+
+### If Simple HTTP Works → Lightweight Architecture
+- Standard HTTP requests in a cron job
+- No browser dependencies, minimal resource usage
+- Scales to thousands of users on a $5/month VPS
+
+### If Headless Browser Required → Network Interception First
+1. Profile the Letterboxd watchlist page's network requests
+2. If client-side API calls exist → intercept JSON, potentially extract credentials for direct API access
+3. If no API calls → use browser context pooling with resource blocking
+4. Consider cloud browser services (Browserless.io) at scale
+
+### If Direct API Access Possible → Best Case
+- Apply for official Letterboxd API access in parallel
+- If not granted, evaluate the ethics/risk of using extracted credentials
+- Pure HTTP-based sync, trivial scaling, clean data
+
+---
+
 ## Sources
 
 - [Letterboxd API Beta](https://letterboxd.com/api-beta/)
@@ -361,3 +576,8 @@ Multiple existing projects have successfully implemented Letterboxd → Stremio 
 - [Stremio Trakt 2-Way Sync Blog Post](https://blog.stremio.com/stremio-tech-update-28-trakt-scrobbling-2-way-sync-more/)
 - [Stremio Addon Advanced Docs](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/advanced.md)
 - [Letterboxd Watchlist Scrapper](https://github.com/skukhniy/letterboxd-watchlist-scrapper)
+- [Getting Letterboxd API Access with mitmproxy](https://blog.alexbeals.com/posts/extracting-letterboxd-tokens-with-mitmproxy)
+- [letterboxdpy - Python Letterboxd Scraper](https://github.com/nmcassa/letterboxdpy)
+- [Playwright Network Interception Docs](https://playwright.dev/docs/network)
+- [Scaling Headless Browsers: Contexts vs Instances](https://dev.to/deepak_mishra_35863517037/scaling-headless-browsers-managing-contexts-vs-instances-1d73)
+- [Challenges of Scaling Playwright/Puppeteer](https://www.zyte.com/blog/challenges-of-scaling-playwright-and-puppeteer-for-web-scraping/)
