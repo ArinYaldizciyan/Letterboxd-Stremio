@@ -28,3 +28,6 @@ out/
 
 # Logs
 *.log
+
+# Test output
+output/
