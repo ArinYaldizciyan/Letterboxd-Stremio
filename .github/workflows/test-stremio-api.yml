@@ -1,0 +1,25 @@
+name: Test Stremio API
+
+on:
+  workflow_dispatch:
+    inputs:
+      imdb_id:
+        description: "IMDb ID to add (e.g. tt0041959)"
+        required: false
+        default: "tt0041959"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run full Stremio API test
+        env:
+          STREMIO_EMAIL: ${{ secrets.STREMIO_EMAIL }}
+          STREMIO_PASSWORD: ${{ secrets.STREMIO_PASSWORD }}
+        run: node scripts/test-stremio-api.js full-test ${{ inputs.imdb_id }}
